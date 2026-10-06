@@ -57,3 +57,37 @@ DROP TRIGGER IF EXISTS measurements_immutable_trg ON measurements;
 CREATE TRIGGER measurements_immutable_trg
     BEFORE UPDATE OR DELETE ON measurements
     FOR EACH ROW EXECUTE FUNCTION reject_measurement_mutation();
+
+-- ---------------------------------------------------------------------------
+-- 测量更正表：追加式版本链
+--   * 原始测量记录视为 version=1，每次更正追加一行，version 递增
+--   * (measurement_id, version) 唯一：同一版本的并发更正最多成功一次
+--   * 与测量表一样不可修改、不可删除（触发器强制）
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS measurement_corrections (
+    id              BIGSERIAL    PRIMARY KEY,
+    measurement_id  BIGINT       NOT NULL REFERENCES measurements (id),
+    version         INT          NOT NULL,
+    base_version    INT          NOT NULL,
+    measured_at     TIMESTAMPTZ  NOT NULL,
+    certificate_id  BIGINT       NOT NULL REFERENCES certificates (id),
+    reason          TEXT         NOT NULL,
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
+
+    CONSTRAINT measurement_corrections_version_chk CHECK (version >= 2 AND base_version = version - 1),
+    CONSTRAINT measurement_corrections_reason_chk  CHECK (length(btrim(reason)) > 0),
+    CONSTRAINT measurement_corrections_uq UNIQUE (measurement_id, version)
+);
+
+CREATE INDEX IF NOT EXISTS measurement_corrections_measurement_idx ON measurement_corrections (measurement_id);
+
+CREATE OR REPLACE FUNCTION reject_correction_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'measurement corrections are immutable: UPDATE/DELETE not allowed';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS measurement_corrections_immutable_trg ON measurement_corrections;
+CREATE TRIGGER measurement_corrections_immutable_trg
+    BEFORE UPDATE OR DELETE ON measurement_corrections
+    FOR EACH ROW EXECUTE FUNCTION reject_correction_mutation();

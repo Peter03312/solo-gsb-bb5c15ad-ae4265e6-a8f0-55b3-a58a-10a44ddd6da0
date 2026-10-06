@@ -64,3 +64,33 @@ class MeasurementOut(BaseModel):
     certificate_id: int
     created_at: datetime
     validity: Validity = Field(description="该记录按当前证书状态计算的实时有效性")
+    version: int = Field(description="当前版本号：1=原始记录，每次更正 +1")
+
+
+class CorrectionCreate(BaseModel):
+    base_version: int = Field(ge=1, description="基于的版本号，须等于当前最新版本")
+    measured_at: AwareDatetime = Field(description="更正后的测量时刻（须带时区）")
+    certificate_no: str = Field(
+        min_length=1, max_length=128, description="更正后的证书编号（须属于原设备）"
+    )
+    reason: str = Field(min_length=1, max_length=500, description="更正原因")
+
+
+class MeasurementVersionOut(BaseModel):
+    version: int = Field(description="版本号：1=原始记录，>=2 为历次更正")
+    device_id: str
+    measured_at: datetime
+    certificate_no: str
+    certificate_id: int
+    reason: str | None = Field(description="更正原因；原始版本为 null")
+    created_at: datetime
+    validity: Validity = Field(description="该版本按当前证书状态计算的实时有效性")
+
+
+class MeasurementHistoryOut(BaseModel):
+    measurement_id: int
+    device_id: str
+    current_version: int = Field(description="当前最新版本号")
+    versions: list[MeasurementVersionOut] = Field(
+        description="按版本号升序：首个为原始版本，其后为历次更正"
+    )

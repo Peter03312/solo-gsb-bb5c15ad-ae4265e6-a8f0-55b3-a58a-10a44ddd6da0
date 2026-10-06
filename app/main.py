@@ -18,8 +18,8 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Lab Equipment Calibration Traceability",
-    version="1.0.0",
-    description="实验室设备校准证书登记与测量记录追溯服务",
+    version="1.1.0",
+    description="实验室设备校准证书登记与测量记录追溯服务（含测量记录追加式更正）",
     lifespan=lifespan,
 )
 
