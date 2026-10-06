@@ -5,6 +5,7 @@
 - 登记设备校准证书：编号、有效起止时刻（**必须带时区**，起点 < 终点，区间**左闭右开** `[valid_from, valid_to)`）
 - 同一设备证书有效期**不得重叠**：由数据库 exclusion 约束保证，**并发提交只有一份成功**，其余返回 409
 - 测量记录：仅当证书**覆盖测量时刻且未撤销**时才接受写入；记录**一经写入不可修改**（数据库触发器强制）
+- 测量更正：测量时刻或证书填错时可提交**带原因的更正**，原始记录与历次更正**只追加、不删改**；每次更正须携带当前版本号，**版本不符返回 409，同一版本的并发更正最多成功一次**
 - 撤销证书**不删除**历史测量；查询时**实时**返回每条记录的当前有效性及原因
 - 证书登记支持**幂等键**：相同键 + 相同内容重试返回首次结果；相同键 + 不同内容返回 409
 
@@ -86,7 +87,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 |---|---|---|
 | `POST` | `/api/v1/measurements` | 写入测量记录，成功 201 |
 | `GET` | `/api/v1/measurements?device_id=&limit=&offset=` | 列表，含实时有效性 |
-| `GET` | `/api/v1/measurements/{id}` | 详情，含实时有效性 |
+| `GET` | `/api/v1/measurements/{id}` | 详情（原始登记版本），含实时有效性 |
+| `POST` | `/api/v1/measurements/{id}/corrections` | 提交更正（**须携带当前版本号**），成功 201 返回新版本 |
+| `GET` | `/api/v1/measurements/{id}/history` | 完整历史：原始版本 + 按序更正链 + 当前版本 |
 
 写入请求体：
 
@@ -118,9 +121,51 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 }
 ```
 
+### 测量更正
+
+发现测量时刻或所用证书填错时，可对指定记录提交**带原因的更正**。原始登记与历次更正**只追加保存，任何版本不得修改或删除**（数据库触发器强制）。
+
+- 原始登记为 **version 1**，每次更正追加一个版本（+1）；更正须携带 `base_version`（当前最新版本号），**版本不符返回 409 `VERSION_CONFLICT`**；同一版本的并发更正由行锁 + 唯一约束保证**最多成功一次**
+- **设备编号不可更正**，始终沿用原始记录的值；`measured_at`（须带时区）与 `certificate_no` 至少提供一个，缺省字段沿用当前版本值
+- 所选证书必须**属于该设备、覆盖新时刻且提交时未撤销**；校验与写入在同一事务内并对证书行加 `FOR UPDATE` 锁，并发撤销不会造成无效更正
+
+更正请求体：
+
+```json
+{
+  "base_version": 1,
+  "measured_at": "2027-03-10T09:00:00+08:00",
+  "certificate_no": "CERT-2027-0001",
+  "reason": "recorded against wrong certificate; re-associated per lab audit"
+}
+```
+
+成功 201 返回新版本（`version`、`measured_at`、`certificate_no`、`reason`、`validity` 等）。典型错误：
+
+| 状态码 | code | 场景 |
+|---|---|---|
+| 404 | `MEASUREMENT_NOT_FOUND` | 测量记录不存在 |
+| 409 | `VERSION_CONFLICT` | `base_version` 与当前最新版本不符（含并发更正冲突） |
+| 422 | （校验错误） | 新时刻缺时区、两个更正字段都未提供 |
+| 422 | `CERTIFICATE_NOT_FOUND` | 证书不存在或不属于该设备 |
+| 422 | `CERTIFICATE_REVOKED` | 目标证书已撤销 |
+| 422 | `MEASUREMENT_TIME_NOT_COVERED` | 证书有效期未覆盖新时刻 |
+
+历史查询 `GET /api/v1/measurements/{id}/history` 一次返回**原始版本、按版本号升序的更正链和当前版本**；每个版本的有效性均按证书撤销状态**实时重算**，旧版历史保留可查：
+
+```json
+{
+  "measurement_id": 1,
+  "device_id": "EQ-001",
+  "original":    {"version": 1, "measured_at": "2026-06-15T02:30:00+00:00", "certificate_no": "CERT-2026-0001", "reason": null, "validity": {"is_valid": true, "reason": "..."}, "...": "..."},
+  "corrections": [{"version": 2, "measured_at": "2027-03-10T01:00:00+00:00", "certificate_no": "CERT-2027-0001", "reason": "recorded against wrong certificate; ...", "validity": {"is_valid": true, "reason": "..."}, "...": "..."}],
+  "current":     {"version": 2, "...": "..."}
+}
+```
+
 ## 调用示例
 
-完整端到端示例（登记 → 幂等重试 → 冲突 → 测量 → 撤销 → 有效性查询）：
+完整端到端示例（登记 → 幂等重试 → 冲突 → 测量 → 撤销 → 有效性查询 → 更正 → 版本冲突/并发 → 历史查询）：
 
 ```bash
 ./examples/demo.sh
@@ -149,6 +194,15 @@ curl -X POST http://localhost:8000/api/v1/certificates/1/revoke \
 
 # 查询测量记录当前有效性
 curl http://localhost:8000/api/v1/measurements?device_id=EQ-001
+
+# 更正测量记录 1：换证书并调整时刻（base_version 为当前最新版本号，原始登记为 1）
+curl -X POST http://localhost:8000/api/v1/measurements/1/corrections \
+  -H 'Content-Type: application/json' \
+  -d '{"base_version":1,"measured_at":"2027-03-10T09:00:00+08:00",
+       "certificate_no":"CERT-2027-0001","reason":"recorded against wrong certificate"}'
+
+# 查询完整历史：原始版本 + 更正链 + 当前版本
+curl http://localhost:8000/api/v1/measurements/1/history
 ```
 
 ## 设计要点
@@ -157,8 +211,10 @@ curl http://localhost:8000/api/v1/measurements?device_id=EQ-001
 - **并发不重叠**：`EXCLUDE USING gist (device_id WITH =, tstzrange WITH &&)` 约束在数据库层串行化并发写入，重叠提交只有一份成功，其余收到 409。
 - **幂等**：`idempotency_key` 唯一约束 + 请求内容规范化哈希（时刻统一换算 UTC 后计算）；同键同内容返回首次结果，同键异内容 409。
 - **测量写入一致性**：校验与写入在同一事务内，并对证书行加 `FOR UPDATE` 锁，防止校验后、写入前证书被并发撤销。
-- **不可篡改**：测量表挂 `BEFORE UPDATE OR DELETE` 触发器直接报错，应用层也不提供修改/删除接口。
-- **撤销即生效**：测量查询实时 JOIN 证书状态，撤销立即反映到全部历史记录的有效性上，历史数据本身保留不动。
+- **不可篡改**：测量表与更正表均挂 `BEFORE UPDATE OR DELETE` 触发器直接报错，应用层也不提供修改/删除接口。
+- **追加式更正链**：更正写入 `measurement_corrections` 表，原始登记为 version 1、每次更正 +1；`(measurement_id, version)` 唯一约束 + 测量记录行锁串行化并发更正，同一版本的并发更正最多成功一次，其余收到 409 `VERSION_CONFLICT`。
+- **更正校验一致性**：更正与撤销互斥——更正事务对目标证书行加 `FOR UPDATE` 锁后再校验撤销状态与有效期覆盖，并发撤销要么先完成（更正看到已撤销并拒绝）、要么等待更正提交，不会产生基于已撤销证书的无效更正。
+- **撤销即生效**：测量查询实时 JOIN 证书状态，撤销立即反映到全部历史记录（含各更正版本）的有效性上，历史数据本身保留不动。
 
 ## 目录结构
 

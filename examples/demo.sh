@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 端到端调用示例：覆盖证书登记、幂等、区间冲突、测量校验、撤销与实时有效性。
+# 端到端调用示例：覆盖证书登记、幂等、区间冲突、测量校验、撤销与实时有效性，
+# 以及测量更正（版本冲突、并发唯一成功、完整历史查询）。
 # 用法: BASE=http://localhost:8000 ./examples/demo.sh
 set -euo pipefail
 
@@ -84,3 +85,32 @@ get "/measurements?device_id=EQ-001"
 
 echo "### 13. 重复撤销 → 409 CERTIFICATE_ALREADY_REVOKED"
 post /certificates/1/revoke '{"reason":"again"}'
+
+echo "### 14. 更正测量记录 1：换用有效证书并调整时刻（携带当前版本号 base_version=1）→ 201，version=2"
+post /measurements/1/corrections \
+  '{"base_version":1,"measured_at":"2027-03-10T09:00:00+08:00","certificate_no":"CERT-2027-0001","reason":"recorded against wrong certificate; re-associated per lab audit"}'
+
+echo "### 15. 用旧版本号再次更正 → 409 VERSION_CONFLICT（只能从最新版本继续）"
+post /measurements/1/corrections \
+  '{"base_version":1,"measured_at":"2027-03-11T09:00:00+08:00","reason":"stale version"}'
+
+echo "### 16. 基于最新版本继续更正：只改时刻、证书沿用（设备编号始终不可改）→ 201，version=3"
+post /measurements/1/corrections \
+  '{"base_version":2,"measured_at":"2027-03-12T09:00:00+08:00","reason":"clock drift confirmed by lab"}'
+
+echo "### 17. 同一版本并发更正：最多成功一次（一个 201，其余 409）"
+curl -sS -o /tmp/corr-a.json -w 'req A -> %{http_code}\n' -X POST "$API/measurements/1/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{"base_version":3,"measured_at":"2027-03-13T09:00:00+08:00","reason":"concurrent correction A"}' &
+curl -sS -o /tmp/corr-b.json -w 'req B -> %{http_code}\n' -X POST "$API/measurements/1/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{"base_version":3,"measured_at":"2027-03-14T09:00:00+08:00","reason":"concurrent correction B"}' &
+wait
+eval "$PPRINT" < /tmp/corr-a.json; eval "$PPRINT" < /tmp/corr-b.json
+
+echo "### 18. 更正到已撤销的证书 → 422 CERTIFICATE_REVOKED（校验与写入同事务加锁，并发撤销不会造成无效更正）"
+post /measurements/1/corrections \
+  '{"base_version":4,"certificate_no":"CERT-2026-0001","measured_at":"2026-06-15T10:30:00+08:00","reason":"try to switch back to revoked cert"}'
+
+echo "### 19. 查询完整历史：原始版本 + 按序更正链 + 当前版本（各版本有效性按证书撤销状态实时重算，旧版历史保留可查）"
+get /measurements/1/history
